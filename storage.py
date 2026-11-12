@@ -39,7 +39,7 @@ class Storage:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_application
                 ON applications(guild_id, applicant_id)
-                WHERE status IN ('creating', 'pending', 'processing');
+                WHERE status IN ('creating', 'pending', 'call_issuing', 'calling', 'processing');
             CREATE UNIQUE INDEX IF NOT EXISTS idx_application_message
                 ON applications(review_message_id)
                 WHERE review_message_id IS NOT NULL;
@@ -59,6 +59,8 @@ class Storage:
                 "crime_role_id": "INTEGER",
                 "state_role_id": "INTEGER",
                 "ping_role_ids": "TEXT NOT NULL DEFAULT ''",
+                "call_channel_id": "INTEGER",
+                "common_role_id": "INTEGER",
             },
             "applications": {
                 "game_nick": "TEXT",
@@ -66,12 +68,23 @@ class Storage:
                 "irl_name_age": "TEXT",
                 "direction": "TEXT",
                 "history": "TEXT",
+                "call_channel_id": "INTEGER",
+                "call_requested_by": "INTEGER",
+                "call_deadline": "INTEGER",
+                "call_result": "TEXT",
             },
         }.items():
             present = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, data_type in columns.items():
                 if name not in present:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {data_type}")
+        # Existing v3 DBs have an older unique index that omits `calling`.
+        # Rebuild it after migration to keep exactly one live application per user.
+        self.conn.execute("DROP INDEX IF EXISTS idx_one_active_application")
+        self.conn.execute(
+            """CREATE UNIQUE INDEX idx_one_active_application ON applications(guild_id, applicant_id)
+               WHERE status IN ('creating', 'pending', 'call_issuing', 'calling', 'processing')"""
+        )
         self.conn.commit()
 
     def config(self, guild_id: int):
@@ -96,9 +109,9 @@ class Storage:
             )
 
     def set_application_ping_roles(self, guild_id: int, role_ids: list[int]):
-        """Replace the entire notification role list (max three, unique, nonzero)."""
-        if len(role_ids) > 3 or any(not isinstance(r, int) or r <= 0 for r in role_ids):
-            raise ValueError("Разрешено от 0 до 3 корректных ID ролей")
+        """Replace notification role IDs; bounded by Discord message and mention limits."""
+        if len(role_ids) > 50 or any(not isinstance(r, int) or r <= 0 for r in role_ids):
+            raise ValueError("Разрешено от 0 до 50 корректных ID ролей")
         if len(set(role_ids)) != len(role_ids):
             raise ValueError("Одинаковые роли нельзя указывать дважды")
         with self.conn:
@@ -107,6 +120,24 @@ class Storage:
                 (",".join(str(role_id) for role_id in role_ids), guild_id),
             )
             if result.rowcount != 1:
+                raise ValueError("Сервер ещё не настроен")
+
+    def set_call_channel(self, guild_id: int, channel_id: int):
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE guild_config SET call_channel_id = ? WHERE guild_id = ?",
+                (channel_id, guild_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Сервер ещё не настроен")
+
+    def set_common_role(self, guild_id: int, role_id: int):
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE guild_config SET common_role_id = ? WHERE guild_id = ?",
+                (role_id, guild_id),
+            )
+            if cursor.rowcount != 1:
                 raise ValueError("Сервер ещё не настроен")
 
     def application_ping_role_ids(self, guild_id: int) -> list[int]:
@@ -118,7 +149,7 @@ class Storage:
     def active_application(self, guild_id: int, applicant_id: int):
         return self.conn.execute(
             """SELECT * FROM applications WHERE guild_id = ? AND applicant_id = ?
-            AND status IN ('creating', 'pending', 'processing')""",
+            AND status IN ('creating', 'pending', 'call_issuing', 'calling', 'processing')""",
             (guild_id, applicant_id),
         ).fetchone()
 
@@ -149,23 +180,94 @@ class Storage:
                 "DELETE FROM applications WHERE id = ? AND status = 'creating'", (app_id,)
             )
 
+    def application_by_id(self, app_id: int):
+        return self.conn.execute(
+            "SELECT * FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+
     def application_for_message(self, message_id: int):
         return self.conn.execute(
             "SELECT * FROM applications WHERE review_message_id = ?", (message_id,)
         ).fetchone()
 
+    def start_call(self, app_id: int, channel_id: int, requester_id: int, deadline: int) -> bool:
+        """Atomically mark a pending application as awaiting the voice interview."""
+        with self.conn:
+            cursor = self.conn.execute(
+                """UPDATE applications SET status = 'call_issuing', call_channel_id = ?,
+                   call_requested_by = ?, call_deadline = ?, call_result = 'waiting'
+                   WHERE id = ? AND status = 'pending'""",
+                (channel_id, requester_id, deadline, app_id),
+            )
+        return cursor.rowcount == 1
+
+    def activate_call(self, app_id: int) -> bool:
+        """Start the real timeout only AFTER the call message is sent."""
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE applications SET status = 'calling' WHERE id = ? AND status = 'call_issuing'",
+                (app_id,),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_call(self, app_id: int):
+        """Only an unfinished invitation can be cancelled."""
+        with self.conn:
+            self.conn.execute(
+                """UPDATE applications SET status = 'pending', call_deadline = NULL,
+                   call_result = 'failed' WHERE id = ? AND status = 'call_issuing'""", (app_id,),
+            )
+
+    def mark_call_joined(self, guild_id: int, user_id: int, channel_id: int, now: int):
+        """Return application only if candidate joined the correct room on time."""
+        with self.conn:
+            cursor = self.conn.execute(
+                """UPDATE applications SET status = 'pending', call_result = 'joined',
+                   call_deadline = NULL WHERE guild_id = ? AND applicant_id = ?
+                   AND status = 'calling' AND call_channel_id = ?
+                   AND call_deadline >= ?""",
+                (guild_id, user_id, channel_id, now),
+            )
+        if cursor.rowcount:
+            return self.active_application(guild_id, user_id)
+        return None
+
+    def expired_calls(self, now: int):
+        return self.conn.execute(
+            """SELECT * FROM applications WHERE status = 'calling'
+               AND call_deadline IS NOT NULL AND call_deadline <= ?
+               ORDER BY call_deadline LIMIT 30""", (now,),
+        ).fetchall()
+
     def claim_application(self, app_id: int) -> bool:
         with self.conn:
             cursor = self.conn.execute(
-                "UPDATE applications SET status = 'processing' WHERE id = ? AND status = 'pending'",
-                (app_id,),
+                """UPDATE applications SET status = 'processing'
+                   WHERE id = ? AND status IN ('pending', 'calling')""", (app_id,),
             )
         return cursor.rowcount == 1
 
     def revert_application(self, app_id: int):
         with self.conn:
             self.conn.execute(
-                "UPDATE applications SET status = 'pending' WHERE id = ? AND status = 'processing'",
+                """UPDATE applications SET status = CASE
+                   WHEN call_result = 'waiting' AND call_deadline IS NOT NULL
+                   THEN 'calling' ELSE 'pending' END
+                   WHERE id = ? AND status = 'processing'""", (app_id,),
+            )
+
+    def mark_call_timeout_failed(self, app_id: int):
+        """Avoid retrying an impossible kick forever; moderators may decide."""
+        with self.conn:
+            self.conn.execute(
+                """UPDATE applications SET status = 'pending', call_result = 'timeout_failed',
+                   call_deadline = NULL WHERE id = ? AND status = 'processing'""", (app_id,),
+            )
+
+    def mark_call_missed(self, app_id: int):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE applications SET call_result = 'missed' WHERE id = ? AND status = 'processing'",
                 (app_id,),
             )
 
@@ -192,14 +294,22 @@ class Storage:
         is treated as successful. Unfinished modal creations are released.
         """
         with self.conn:
-            self.conn.execute("UPDATE applications SET status = 'pending' WHERE status = 'processing'")
+            self.conn.execute(
+                """UPDATE applications SET status = CASE
+                   WHEN call_result = 'waiting' AND call_deadline IS NOT NULL
+                   THEN 'calling' ELSE 'pending' END WHERE status = 'processing'"""
+            )
             self.conn.execute("DELETE FROM applications WHERE status = 'creating'")
+            self.conn.execute(
+                """UPDATE applications SET status = 'pending', call_deadline = NULL,
+                   call_result = 'failed' WHERE status = 'call_issuing'"""
+            )
 
     def reset_missing_thread(self, thread_id: int):
         with self.conn:
             self.conn.execute(
                 """DELETE FROM applications WHERE thread_id = ?
-                AND status IN ('pending', 'creating')""",
+                AND status IN ('pending', 'creating', 'call_issuing', 'calling')""",
                 (thread_id,),
             )
 

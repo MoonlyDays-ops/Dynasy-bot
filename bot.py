@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 import discord
@@ -32,6 +33,22 @@ def parse_user_id(value: str) -> int | None:
     """Allow Discord IDs or <@mentions>; do not guess from names."""
     match = re.fullmatch(r"\s*(?:<@!?(\d{15,22})>|(\d{15,22}))\s*", value)
     return int(match.group(1) or match.group(2)) if match else None
+
+
+def parse_role_list(text: str) -> list[int]:
+    """Comma/space/newline-separated Discord role IDs or role mentions."""
+    parts = re.split(r"[,;\s]+", text.strip())
+    if not text.strip() or len(parts) > 50:
+        raise ValueError("Укажите от 1 до 50 ролей (ID или @упоминания).")
+    result = []
+    for part in parts:
+        match = re.fullmatch(r"(?:<@&(\d{15,22})>|(\d{15,22}))", part)
+        if not match:
+            raise ValueError(f"Неверное значение роли: {part[:50]}")
+        value = int(match.group(1) or match.group(2))
+        if value not in result:
+            result.append(value)
+    return result
 
 
 async def say(interaction: discord.Interaction, message: str):
@@ -133,7 +150,7 @@ async def prepare_application_channel(guild: discord.Guild, settings, bot_member
     bot_ow = channel.overwrites_for(bot_member)
     bot_ow.update(view_channel=True, send_messages=True, read_message_history=True,
                   create_private_threads=True, send_messages_in_threads=True,
-                  manage_threads=True, embed_links=True, attach_files=True)
+                  manage_threads=True, manage_messages=True, embed_links=True, attach_files=True)
     await channel.set_permissions(bot_member, overwrite=bot_ow,
                                   reason="DYNASTY: доступ бота к приватным веткам")
     mod_ow = channel.overwrites_for(moderator)
@@ -152,12 +169,25 @@ async def prepare_application_channel(guild: discord.Guild, settings, bot_member
 
 async def send_application_dm(user: discord.abc.User, *, app_id: int, guild_name: str,
                               status: str, direction: str | None = None,
-                              role_name: str | None = None) -> bool:
+                              role_name: str | None = None,
+                              call_channel: discord.VoiceChannel | None = None) -> bool:
     """Best effort: closed DMs must never cancel an already-processed decision."""
     if status == "pending":
         title = "📨 Заявка получена"
         body = f"Ваша заявка №{app_id} на сервер **{guild_name}** принята к рассмотрению."
         color = discord.Color.gold()
+    elif status == "called":
+        title = "📞 Вас вызвали на обзвон"
+        channel_text = call_channel.mention if call_channel else "голосовой канал обзвона"
+        body = (f"Ваша заявка №{app_id} на сервер **{guild_name}**: "
+                f"зайдите в {channel_text} в течение **5 минут**, "
+                "иначе заявка будет автоматически отклонена и вы будете исключены с сервера.")
+        color = discord.Color.orange()
+    elif status == "arrived":
+        title = "✅ Явка на обзвон зафиксирована"
+        body = (f"Вы вошли в канал обзвона по заявке №{app_id} на сервере **{guild_name}**. "
+                "Автоматическое отклонение отменено, ожидайте решения модератора.")
+        color = discord.Color.green()
     elif status == "accepted":
         title = "✅ Заявка одобрена"
         body = (f"Ваша заявка №{app_id} на сервер **{guild_name}** одобрена!\n"
@@ -175,6 +205,79 @@ async def send_application_dm(user: discord.abc.User, *, app_id: int, guild_name
     except (discord.Forbidden, discord.HTTPException):
         LOG.info("Could not DM application status to user %s", user.id)
         return False
+
+
+def application_audit_embed(entry, *, event: str, actor_id: int | None = None,
+                            dm_sent: bool | None = None, note: str | None = None) -> discord.Embed:
+    """Always retain the full submitted form in the private audit log."""
+    colors = {"received": discord.Color.gold(), "called": discord.Color.orange(),
+              "arrived": discord.Color.green(), "accepted": discord.Color.green(),
+              "rejected": discord.Color.red(), "timeout_failed": discord.Color.red()}
+    labels = {"received": "📨 Отправлена", "called": "📞 Вызван на обзвон",
+              "arrived": "🎙️ Прибыл на обзвон", "accepted": "✅ Принята",
+              "rejected": "❌ Отклонена", "timeout_failed": "⚠️ Не удалось выполнить автоотказ"}
+    embed = discord.Embed(
+        title=f"Заявка №{entry['id']}: {labels.get(event, event)}",
+        description=f"**Кандидат:** <@{entry['applicant_id']}> (`{entry['applicant_id']}`)",
+        color=colors.get(event, discord.Color.blurple()),
+    )
+    embed.add_field(name="1. Ник в игре", value=safe_embed_value(entry['game_nick'] or '—'), inline=False)
+    embed.add_field(name="2. Статик #", value=safe_embed_value(entry['static_number'] or '—'), inline=True)
+    embed.add_field(name="3. Имя и возраст IRL", value=safe_embed_value(entry['irl_name_age'] or '—'), inline=True)
+    embed.add_field(name="4. Направление", value=safe_embed_value(entry['direction'] or '—'), inline=False)
+    embed.add_field(name="5. Как узнали о семье и другие семьи",
+                    value=safe_embed_value(entry['history'] or '—'), inline=False)
+    if actor_id is not None:
+        embed.add_field(name="Модератор", value=f"<@{actor_id}>", inline=True)
+    else:
+        embed.add_field(name="Решение", value="Автоматическая проверка", inline=True)
+    if dm_sent is not None:
+        embed.add_field(name="Личное сообщение", value="Отправлено" if dm_sent else "Не доставлено", inline=True)
+    if entry['call_channel_id']:
+        embed.add_field(name="Канал обзвона", value=f"<#{entry['call_channel_id']}>", inline=True)
+    if entry['call_result']:
+        outcomes = {"waiting": "Ожидается", "joined": "Прибыл вовремя",
+                    "missed": "Не прибыл за 5 минут", "failed": "Ошибка вызова",
+                    "timeout_failed": "Ошибка автоотказа"}
+        embed.add_field(name="Обзвон", value=outcomes.get(entry['call_result'], entry['call_result']), inline=True)
+    if note:
+        embed.add_field(name="Примечание", value=safe_embed_value(note), inline=False)
+    embed.set_footer(text=f"ID заявки: {entry['id']} • ID пользователя: {entry['applicant_id']}")
+    return embed
+
+
+async def write_application_log(bot: "ApprovalVoiceBot", guild: discord.Guild,
+                                entry, *, event: str, actor_id: int | None = None,
+                                dm_sent: bool | None = None, note: str | None = None):
+    settings = bot.db.config(guild.id)
+    if settings is None:
+        return
+    channel = guild.get_channel(settings["log_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        LOG.warning("Application log channel missing on guild %s", guild.id)
+        return
+    try:
+        await channel.send(
+            embed=application_audit_embed(entry, event=event, actor_id=actor_id,
+                                          dm_sent=dm_sent, note=note),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        LOG.exception("Could not log application %s event %s", entry['id'], event)
+
+
+async def safely_delete_application_thread(bot: "ApprovalVoiceBot", guild: discord.Guild, entry,
+                                            reason: str):
+    if not entry["thread_id"]:
+        return
+    try:
+        thread = guild.get_thread(entry["thread_id"]) or await guild.fetch_channel(entry["thread_id"])
+        if isinstance(thread, discord.Thread):
+            await thread.delete(reason=reason)
+    except discord.NotFound:
+        pass
+    except discord.HTTPException:
+        LOG.exception("Could not delete application thread %s", entry['thread_id'])
 
 
 def voice_panel_embed() -> discord.Embed:
@@ -305,6 +408,10 @@ class ApplicationModal(discord.ui.Modal, title="Заявка в DYNASTY FAMILY")
                 ),
             )
             self.bot.db.attach_application(application_id, thread.id, message.id)
+            await write_application_log(
+                self.bot, guild, self.bot.db.application_by_id(application_id), event="received",
+                actor_id=interaction.user.id,
+            )
         except Exception:
             LOG.exception("Could not create application %s", application_id)
             self.bot.db.abort_application(application_id)
@@ -356,55 +463,65 @@ class ReviewView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
-    async def decide(self, interaction: discord.Interaction, accepted: bool):
+    async def context(self, interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member) or interaction.message is None:
-            return await say(interaction, "Команда работает только внутри ветки заявки.")
+            await say(interaction, "Кнопки работают только внутри ветки заявки.")
+            return None
         settings = self.bot.db.config(guild.id)
         entry = self.bot.db.application_for_message(interaction.message.id)
         if settings is None or entry is None or interaction.channel_id != entry["thread_id"]:
-            return await say(interaction, "Заявка не найдена или уже удалена.")
+            await say(interaction, "Заявка не найдена или уже удалена.")
+            return None
         moderator_role = guild.get_role(settings["moderator_role_id"])
         if not (interaction.user.guild_permissions.administrator or
                 (moderator_role is not None and moderator_role in interaction.user.roles)):
-            return await say(interaction, "Рассматривать заявки могут только модераторы.")
-        if not self.bot.db.claim_application(entry["id"]):
-            return await say(interaction, "Эту заявку уже рассматривают или решение принято.")
+            await say(interaction, "Рассматривать заявки могут только модераторы.")
+            return None
+        return guild, settings, entry
 
+    async def decide(self, interaction: discord.Interaction, accepted: bool):
+        context = await self.context(interaction)
+        if context is None:
+            return
+        guild, settings, entry = context
+        if not self.bot.db.claim_application(entry["id"]):
+            return await say(interaction, "Заявку уже рассматривают или решение принято.")
         await interaction.response.defer(ephemeral=True, thinking=True)
         selected_role = None
-        direction = entry["direction"]
+        common_role = None
         dm_sent = False
+        applicant = None
+        direction = entry["direction"]
         try:
             applicant = await get_member(guild, entry["applicant_id"])
             me = guild.me or await guild.fetch_member(self.bot.user.id)
             if accepted:
-                if direction == "Crime":
-                    role_id = settings["crime_role_id"]
-                elif direction == "State":
-                    role_id = settings["state_role_id"]
-                else:
-                    # Support old pending applications created before the update.
-                    role_id = settings["approved_role_id"]
+                role_id = (settings["crime_role_id"] if direction == "Crime" else
+                           settings["state_role_id"] if direction == "State" else
+                           settings["approved_role_id"])
                 selected_role = guild.get_role(role_id) if role_id else None
+                common_id = settings["common_role_id"]
+                common_role = guild.get_role(common_id) if common_id else None
                 if selected_role is None:
-                    raise RuntimeError("Роль для выбранного направления не найдена. Обновите настройки.")
-                if selected_role >= me.top_role:
-                    raise RuntimeError("Роль бота должна находиться выше выдаваемой роли.")
+                    raise RuntimeError("Роль Crime/State не найдена.")
+                if common_role is None:
+                    raise RuntimeError("Сначала настройте обязательную роль: /set_application_common_role.")
+                if selected_role >= me.top_role or common_role >= me.top_role:
+                    raise RuntimeError("Роль бота должна быть выше ВСЕХ выдаваемых ролей.")
                 if applicant is None:
-                    raise RuntimeError("Заявитель уже покинул сервер; назначить роль нельзя.")
+                    raise RuntimeError("Кандидат уже покинул сервер.")
                 await applicant.add_roles(
-                    selected_role, reason=f"Заявка #{entry['id']} ({direction or 'старая'}) одобрена {interaction.user}",
+                    selected_role, common_role,
+                    reason=f"Заявка #{entry['id']} одобрена {interaction.user}",
                 )
                 decision = "accepted"
             else:
                 if applicant is not None:
                     if applicant.id == guild.owner_id or applicant.top_role >= me.top_role:
-                        raise RuntimeError("Не могу исключить владельца или пользователя выше роли бота.")
+                        raise RuntimeError("Нельзя исключить владельца или участника с ролью выше роли бота.")
                     if not me.guild_permissions.kick_members:
-                        raise RuntimeError("У бота отсутствует разрешение Kick Members.")
-                    # Send before kick: without a shared server, the DM may be
-                    # rejected by Discord even when the user's DMs are enabled.
+                        raise RuntimeError("У бота нет права исключать участников (Kick Members).")
                     dm_sent = await send_application_dm(
                         applicant, app_id=entry["id"], guild_name=guild.name,
                         status="rejected", direction=direction,
@@ -419,11 +536,8 @@ class ReviewView(discord.ui.View):
         except Exception:
             self.bot.db.revert_application(entry["id"])
             LOG.exception("Unexpected application moderation failure")
-            return await say(interaction, "❌ Внутренняя ошибка. Проверьте журнал бота.")
+            return await say(interaction, "❌ Внутренняя ошибка. Проверьте логи.")
 
-        status = "✅ Принята" if accepted else "❌ Отклонена"
-        # Accepted: notify after role assignment; rejected: already notified
-        # before kick. When the applicant had already left, try fetching a user.
         if accepted or applicant is None:
             applicant_user = applicant
             if applicant_user is None:
@@ -432,45 +546,22 @@ class ReviewView(discord.ui.View):
                 except discord.HTTPException:
                     applicant_user = None
             if applicant_user is not None:
+                role_names = (f"{selected_role.name} + {common_role.name}" if accepted else None)
                 dm_sent = await send_application_dm(
                     applicant_user, app_id=entry["id"], guild_name=guild.name,
-                    status=decision, direction=direction,
-                    role_name=selected_role.name if selected_role else None,
+                    status=decision, direction=direction, role_name=role_names,
                 )
-
-        log_channel = guild.get_channel(settings["log_channel_id"])
-        if isinstance(log_channel, discord.TextChannel):
-            try:
-                embed = discord.Embed(
-                    title=f"Заявка №{entry['id']}: {status}",
-                    color=discord.Color.green() if accepted else discord.Color.red(),
-                    description=(f"**Заявитель:** <@{entry['applicant_id']}> (`{entry['applicant_id']}`)\n"
-                                 f"**Направление:** {direction or 'старая анкета'}\n"
-                                 f"**Модератор:** <@{interaction.user.id}>\n"
-                                 f"**ЛС:** {'доставлено' if dm_sent else 'не удалось доставить'}"),
-                )
-                await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-            except discord.HTTPException:
-                LOG.exception("Could not write moderation log")
-
-        thread = interaction.channel
-        if isinstance(thread, discord.Thread):
-            try:
-                await thread.delete(reason=f"Заявка #{entry['id']}: {status}")
-            except discord.HTTPException:
-                LOG.exception("Application handled, but thread could not be deleted")
-                return await say(interaction, f"{status}. Действие выполнено, но ветку нужно удалить вручную.")
-        # Legacy applications used an anchor message in another channel.
-        if entry["anchor_message_id"]:
-            anchor_channel = guild.get_channel(settings["review_channel_id"])
-            if isinstance(anchor_channel, discord.TextChannel):
-                try:
-                    anchor = await anchor_channel.fetch_message(entry["anchor_message_id"])
-                    await anchor.delete()
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    LOG.warning("Review anchor could not be deleted for #%s", entry["id"])
-        extra = "" if dm_sent else " Участник не получил ЛС (возможно, сообщения закрыты)."
-        await say(interaction, f"{status}. Ветка удалена, решение сохранено в журнале.{extra}")
+        await write_application_log(
+            self.bot, guild, self.bot.db.application_by_id(entry["id"]),
+            event=decision, actor_id=interaction.user.id, dm_sent=dm_sent,
+            note=(f"Выданы роли: {selected_role.name}, {common_role.name}" if accepted else None),
+        )
+        await safely_delete_application_thread(
+            self.bot, guild, entry, f"Заявка #{entry['id']} {decision}",
+        )
+        await say(interaction, f"{'✅ Принята' if accepted else '❌ Отклонена'}. "
+                  "Решение сохранено в журнале, удаление ветки выполнено при наличии доступа."
+                  + (" ЛС не доставлено." if not dm_sent else ""))
 
     @discord.ui.button(label="Принять", emoji="✅", style=discord.ButtonStyle.success,
                        custom_id="avb:application:accept")
@@ -481,6 +572,62 @@ class ReviewView(discord.ui.View):
                        custom_id="avb:application:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.decide(interaction, False)
+
+    @discord.ui.button(label="Вызвать на обзвон", emoji="📞", style=discord.ButtonStyle.primary,
+                       custom_id="avb:application:call")
+    async def call(self, interaction: discord.Interaction, button: discord.ui.Button):
+        context = await self.context(interaction)
+        if context is None:
+            return
+        guild, settings, entry = context
+        channel_id = settings["call_channel_id"]
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.VoiceChannel):
+            return await say(interaction, "❌ Сначала назначьте голосовой канал командой /set_application_call_channel.")
+        applicant = await get_member(guild, entry["applicant_id"])
+        if applicant is None:
+            return await say(interaction, "Кандидат покинул сервер. Добавить его в ветку нельзя.")
+        if not channel.permissions_for(applicant).view_channel or not channel.permissions_for(applicant).connect:
+            return await say(interaction, "У кандидата нет доступа к голосовому каналу обзвона.")
+        if entry["status"] != "pending":
+            return await say(interaction, "Обзвон уже назначен или заявка находится на рассмотрении.")
+        deadline = int(time.time()) + 300
+        if not self.bot.db.start_call(entry["id"], channel.id, interaction.user.id, deadline):
+            return await say(interaction, "Статус заявки изменился. Повторите действие при необходимости.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        thread = interaction.channel
+        try:
+            if not isinstance(thread, discord.Thread):
+                raise RuntimeError("Канал заявки больше не является веткой.")
+            await thread.add_user(applicant)
+            await thread.send(
+                content=(f"{applicant.mention}, **вас вызвали на обзвон!**\n"
+                         f"Зайдите в голосовой канал {channel.mention} в течение **5 минут** "
+                         "(<t:" + str(deadline) + ":R>), иначе ваша заявка будет отклонена "
+                         "и вы будете исключены с сервера."),
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False,
+                                                          users=[applicant], replied_user=False),
+            )
+            if not self.bot.db.activate_call(entry["id"]):
+                raise RuntimeError("Не удалось подтвердить вызов в базе данных.")
+        except (discord.HTTPException, RuntimeError, sqlite3.Error) as exc:
+            self.bot.db.cancel_call(entry["id"])
+            LOG.warning("Could not call applicant: %s", exc)
+            return await say(interaction, f"❌ Не удалось добавить кандидата или отправить вызов: {exc}")
+        dm_sent = await send_application_dm(
+            applicant, app_id=entry["id"], guild_name=guild.name,
+            status="called", call_channel=channel,
+        )
+        await write_application_log(
+            self.bot, guild, self.bot.db.application_by_id(entry["id"]),
+            event="called", actor_id=interaction.user.id, dm_sent=dm_sent,
+            note=f"Время истечения: <t:{deadline}:F>",
+        )
+        # If already in the designated channel, immediately count this as attendance.
+        if applicant.voice and applicant.voice.channel and applicant.voice.channel.id == channel.id:
+            await self.bot.record_call_arrival(guild, applicant, channel)
+        await say(interaction, f"📞 Кандидат добавлен в ветку и вызван в {channel.mention}. "
+                  "При отсутствии в канале через 5 минут заявка будет автоматически отклонена.")
 
 
 class RoomModal(discord.ui.Modal):
@@ -716,6 +863,7 @@ class ApprovalVoiceBot(commands.Bot):
         self.db = Storage(DATABASE_PATH)
         self.voice_lock = asyncio.Lock()
         self._rooms_reconciled = False
+        self._call_task: asyncio.Task | None = None
 
     async def setup_hook(self):
         # Release operations left half-finished by a crashed previous process.
@@ -724,6 +872,7 @@ class ApprovalVoiceBot(commands.Bot):
         self.add_view(ApplicationPanelView(self))
         self.add_view(ReviewView(self))
         self.add_view(VoiceControlView(self))
+        self._call_task = asyncio.create_task(self.call_timeout_loop(), name="application-call-timeouts")
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -757,6 +906,114 @@ class ApprovalVoiceBot(commands.Bot):
                 except discord.HTTPException:
                     LOG.exception("Unable to clean empty room %s", channel.id)
 
+    async def close(self):
+        if self._call_task and not self._call_task.done():
+            self._call_task.cancel()
+            try:
+                await self._call_task
+            except asyncio.CancelledError:
+                pass
+        await super().close()
+        self.db.close()
+
+    async def record_call_arrival(self, guild: discord.Guild, member: discord.Member,
+                                  channel: discord.VoiceChannel):
+        entry = self.db.mark_call_joined(guild.id, member.id, channel.id, int(time.time()))
+        if entry is None:
+            return
+        try:
+            thread = guild.get_thread(entry["thread_id"]) or await guild.fetch_channel(entry["thread_id"])
+            if isinstance(thread, discord.Thread):
+                await thread.send(
+                    f"✅ {member.mention} прибыл на обзвон в {channel.mention} вовремя. "
+                    "Автоматическое отклонение отменено. Ожидается решение администрации.",
+                    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False,
+                                                              users=[member], replied_user=False),
+                )
+        except discord.HTTPException:
+            LOG.exception("Could not notify arrival in application thread %s", entry['id'])
+        await write_application_log(self, guild, entry, event="arrived",
+                                    actor_id=entry["call_requested_by"])
+        await send_application_dm(member, app_id=entry["id"], guild_name=guild.name,
+                                  status="arrived")
+
+    async def call_timeout_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                now = int(time.time())
+                for entry in self.db.expired_calls(now):
+                    await self.process_expired_call(entry)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Error checking application call deadlines")
+            await asyncio.sleep(10)
+
+    async def process_expired_call(self, entry):
+        guild = self.get_guild(entry["guild_id"])
+        if guild is None or guild.unavailable:
+            # Wait until we can verify membership instead of guessing.
+            return
+        applicant = await get_member(guild, entry["applicant_id"])
+        if (applicant is not None and applicant.voice and applicant.voice.channel and
+                applicant.voice.channel.id == entry["call_channel_id"]):
+            # If the candidate is in the required voice channel, err on their side
+            # in case a gateway event was lost. Do not auto-kick them.
+            saved = self.db.mark_call_joined(guild.id, applicant.id,
+                                             entry["call_channel_id"], entry["call_deadline"])
+            if saved:
+                await write_application_log(self, guild, saved, event="arrived",
+                                            actor_id=entry["call_requested_by"],
+                                            note="Подключение подтверждено при проверке таймера")
+            return
+        # A deleted interview channel must never trigger an unfair kick.
+        call_channel = guild.get_channel(entry["call_channel_id"])
+        if not isinstance(call_channel, discord.VoiceChannel):
+            if self.db.claim_application(entry["id"]):
+                self.db.mark_call_timeout_failed(entry["id"])
+                await write_application_log(
+                    self, guild, self.db.application_by_id(entry["id"]),
+                    event="timeout_failed", note="Канал обзвона удалён: нужна ручная проверка",
+                )
+            return
+        if not self.db.claim_application(entry["id"]):
+            return
+        dm_sent = False
+        try:
+            me = guild.me or await guild.fetch_member(self.user.id)
+            if applicant is not None:
+                if applicant.id == guild.owner_id or applicant.top_role >= me.top_role:
+                    raise RuntimeError("Иерархия ролей запрещает автоматическое исключение")
+                if not me.guild_permissions.kick_members:
+                    raise RuntimeError("У бота нет Kick Members")
+                dm_sent = await send_application_dm(
+                    applicant, app_id=entry["id"], guild_name=guild.name,
+                    status="rejected", direction=entry["direction"],
+                )
+                await applicant.kick(reason=f"Заявка #{entry['id']}: не явился на обзвон за 5 минут")
+            self.db.mark_call_missed(entry["id"])
+            self.db.finish_application(entry["id"], "rejected", entry["call_requested_by"] or 0)
+        except (discord.HTTPException, RuntimeError):
+            LOG.exception("Auto-reject failed for application %s", entry['id'])
+            self.db.mark_call_timeout_failed(entry["id"])
+            refreshed = self.db.application_by_id(entry["id"])
+            await write_application_log(self, guild, refreshed, event="timeout_failed",
+                                        note="Автоисключение не удалось; требуется решение модератора")
+            try:
+                thread = guild.get_thread(entry["thread_id"]) or await guild.fetch_channel(entry["thread_id"])
+                if isinstance(thread, discord.Thread):
+                    await thread.send("⚠️ Автоматическое отклонение не выполнено: "
+                                      "проверьте роль и права бота, рассмотрите заявку вручную.")
+            except discord.HTTPException:
+                pass
+            return
+        refreshed = self.db.application_by_id(entry["id"])
+        await write_application_log(self, guild, refreshed, event="rejected", dm_sent=dm_sent,
+                                    note="Автоотказ: кандидат не зашёл на обзвон в течение 5 минут")
+        await safely_delete_application_thread(self, guild, entry, "Не явился на обзвон за 5 минут")
+        LOG.info("Application %s auto-rejected after call timeout", entry['id'])
+
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         if isinstance(channel, discord.VoiceChannel):
             self.db.remove_room(channel.id)
@@ -769,6 +1026,8 @@ class ApprovalVoiceBot(commands.Bot):
                                     after: discord.VoiceState):
         if member.bot or before.channel == after.channel:
             return
+        if isinstance(after.channel, discord.VoiceChannel):
+            await self.record_call_arrival(member.guild, member, after.channel)
         settings = self.db.config(member.guild.id)
         if settings is None:
             return
@@ -873,12 +1132,14 @@ bot = ApprovalVoiceBot()
 @bot.tree.command(name="setup_server", description="Первичная настройка заявок и временных голосовых комнат")
 @app_commands.describe(crime_role="Роль после одобрения направления Crime",
                        state_role="Роль после одобрения направления State",
-                       moderator_role="Роль, которой разрешено рассматривать анкеты")
+                       moderator_role="Роль, которой разрешено рассматривать анкеты",
+                       common_role="Общая обязательная роль всем принятым (можно указать позже)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_server(interaction: discord.Interaction, crime_role: discord.Role,
-                       state_role: discord.Role, moderator_role: discord.Role):
+                       state_role: discord.Role, moderator_role: discord.Role,
+                       common_role: discord.Role | None = None):
     guild = interaction.guild
     if guild is None:
         return await say(interaction, "Команда доступна только на сервере.")
@@ -890,6 +1151,8 @@ async def setup_server(interaction: discord.Interaction, crime_role: discord.Rol
             {crime_role.id, state_role.id, moderator_role.id}) != 3:
         return await say(interaction, "Выберите три разные роли, не @everyone.")
     me = guild.me or await guild.fetch_member(bot.user.id)
+    if common_role and (common_role.is_default() or common_role >= me.top_role):
+        return await say(interaction, "Общая роль должна быть ниже роли бота и не @everyone.")
     if any(role >= me.top_role for role in (crime_role, state_role)):
         return await say(interaction, "Переместите роль бота ВЫШЕ ролей Crime и State.")
 
@@ -899,7 +1162,7 @@ async def setup_server(interaction: discord.Interaction, crime_role: discord.Rol
         bot_perms = discord.PermissionOverwrite(
             view_channel=True, send_messages=True, read_message_history=True,
             embed_links=True, create_private_threads=True, create_public_threads=True,
-            send_messages_in_threads=True, manage_threads=True, attach_files=True,
+            send_messages_in_threads=True, manage_threads=True, manage_messages=True, attach_files=True,
         )
         panel_perms = {
             everyone: discord.PermissionOverwrite(
@@ -951,6 +1214,7 @@ async def setup_server(interaction: discord.Interaction, crime_role: discord.Rol
             "lobby_channel_id": lobby.id,
             "voice_category_id": voice_category.id,
             "ping_role_ids": str(moderator_role.id),  # default notification on new servers
+            "common_role_id": common_role.id if common_role else None,
         })
         await publish_application_panel(bot, application_channel)
         await control_channel.send(embed=voice_panel_embed(), view=VoiceControlView(bot))
@@ -960,6 +1224,7 @@ async def setup_server(interaction: discord.Interaction, crime_role: discord.Rol
             f"• Журнал: {log_channel.mention}\n"
             f"• Crime: {crime_role.mention}\n"
             f"• State: {state_role.mention}\n"
+            f"• Общая роль: {common_role.mention if common_role else 'установите /set_application_common_role'}\n"
             f"• Создание голоса: {lobby.mention}\n"
             f"• Управление: {control_channel.mention}\n"
             f"• Уведомления о новых заявках: {moderator_role.mention} "
@@ -1000,49 +1265,79 @@ async def set_application_roles(interaction: discord.Interaction, crime_role: di
     ))
 
 
-@bot.tree.command(name="set_application_ping_roles", description="Роли для уведомления в новых ветках заявок")
-@app_commands.describe(
-    role1="Первая роль, которую упоминать при новой заявке",
-    role2="Вторая роль (необязательно)",
-    role3="Третья роль (необязательно)",
-)
+@bot.tree.command(name="set_application_ping_roles", description="Настроить до 50 ролей для уведомлений о заявках")
+@app_commands.describe(roles="Упоминания или ID ролей через пробел/запятую; максимум 50")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def set_application_ping_roles(interaction: discord.Interaction, role1: discord.Role,
-                                     role2: discord.Role | None = None,
-                                     role3: discord.Role | None = None):
+async def set_application_ping_roles(interaction: discord.Interaction, roles: str):
     guild = interaction.guild
     settings = bot.db.config(guild.id) if guild else None
     if settings is None:
         return await say(interaction, "Сначала выполните /setup_server.")
-    roles = [role for role in (role1, role2, role3) if role is not None]
-    if any(role.is_default() for role in roles):
-        return await say(interaction, "❌ Роль @everyone выбирать нельзя.")
-    if len({role.id for role in roles}) != len(roles):
-        return await say(interaction, "❌ Нельзя указывать одну и ту же роль несколько раз.")
     try:
-        bot.db.set_application_ping_roles(guild.id, [role.id for role in roles])
-    except (sqlite3.Error, ValueError) as exc:
-        LOG.exception("Could not save application notification roles")
-        return await say(interaction, f"❌ Не удалось сохранить роли уведомлений: {exc}")
+        role_ids = parse_role_list(roles)
+    except ValueError as exc:
+        return await say(interaction, f"❌ {exc}")
+    selected = []
+    for role_id in role_ids:
+        role = guild.get_role(role_id)
+        if role is None or role.is_default():
+            return await say(interaction, f"❌ Роль с ID {role_id} не найдена или это @everyone.")
+        selected.append(role)
+    bot.db.set_application_ping_roles(guild.id, [role.id for role in selected])
     channel = guild.get_channel(settings["application_channel_id"])
-    missing_mention_permission = []
+    missing = []
     if isinstance(channel, discord.TextChannel):
         me = guild.me or await guild.fetch_member(bot.user.id)
-        can_mention_any_role = channel.permissions_for(me).mention_everyone
-        missing_mention_permission = [r.name for r in roles
-                                      if not r.mentionable and not can_mention_any_role]
-    response = ("✅ При каждой новой заявке в приватной ветке будет сообщение с упоминанием: "
-                + ", ".join(role.mention for role in roles)
-                + ".\nОбновлять панель /republish_panels не требуется.")
-    if missing_mention_permission:
-        response += ("\n⚠️ Для настоящего уведомления разрешите упоминание указанных ролей "
-                     "или предоставьте боту право «Упоминать @everyone, @here и все роли» "
-                     "в канале заявок. Сейчас не все упоминания могут уведомлять участников.")
-    response += ("\n⚠️ Ветка приватная: участникам этих ролей нужен доступ к ней. "
-                 "Модераторам можно предоставить «Просматривать канал» и «Управлять ветками».")
+        can_ping = channel.permissions_for(me).mention_everyone
+        missing = [role.name for role in selected if not role.mentionable and not can_ping]
+    response = (f"✅ Настроено {len(selected)} ролей для упоминания в новых заявках. "
+                "Настройки сохранены в базе данных. Панель обновлять не нужно.")
+    if missing:
+        response += ("\n⚠️ Некоторые роли недоступны для уведомлений: "
+                     "включите «Разрешить упоминание роли» или право бота на упоминания.")
+    response += ("\n⚠️ Ролям необходим доступ к приватным веткам, "
+                 "например право «Управлять ветками» и «Просматривать канал».")
     await say(interaction, response)
+
+
+@bot.tree.command(name="set_application_call_channel", description="Выбрать голосовой канал для обзвона кандидатов")
+@app_commands.describe(channel="Голосовой канал, куда кандидат должен зайти за 5 минут")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_application_call_channel(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    guild = interaction.guild
+    if guild is None or bot.db.config(guild.id) is None:
+        return await say(interaction, "Сначала выполните /setup_server.")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        me = guild.me or await guild.fetch_member(bot.user.id)
+        await prepare_application_channel(guild, bot.db.config(guild.id), me)
+        bot.db.set_call_channel(guild.id, channel.id)
+    except (discord.HTTPException, RuntimeError, sqlite3.Error) as exc:
+        LOG.exception("Could not configure application call channel")
+        return await say(interaction, f"❌ Не удалось настроить обзвон и доступ к веткам: {exc}")
+    await say(interaction, f"✅ Голосовой канал обзвона: {channel.mention}. "
+              "После вызова кандидату даётся 5 минут на вход.")
+
+
+@bot.tree.command(name="set_application_common_role", description="Общая роль каждому одобренному кандидату")
+@app_commands.describe(role="Роль, добавляемая вместе с Crime или State")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_application_common_role(interaction: discord.Interaction, role: discord.Role):
+    guild = interaction.guild
+    if guild is None or bot.db.config(guild.id) is None:
+        return await say(interaction, "Сначала выполните /setup_server.")
+    me = guild.me or await guild.fetch_member(bot.user.id)
+    if role.is_default() or role >= me.top_role:
+        return await say(interaction, "❌ Общая роль должна быть ниже роли бота и не @everyone.")
+    bot.db.set_common_role(guild.id, role.id)
+    await say(interaction, f"✅ При любом одобрении бот выдаст {role.mention} "
+              "вместе с ролью Crime или State.")
 
 
 @bot.tree.command(name="clear_application_ping_roles", description="Выключить упоминания ролей в новых заявках")
@@ -1122,8 +1417,12 @@ async def bot_status(interaction: discord.Interaction):
         return await say(interaction, "⚠️ Бот работает, но роли Crime и State не настроены. Администратор: /set_application_roles.")
     ping_roles = application_ping_roles(guild, bot)
     ping_summary = ", ".join(role.name for role in ping_roles) if ping_roles else "не назначены"
+    call_channel = guild.get_channel(cfg["call_channel_id"]) if cfg["call_channel_id"] else None
+    common_role = guild.get_role(cfg["common_role_id"]) if cfg["common_role_id"] else None
     await say(interaction, "✅ Бот работает. Роли Crime/State настроены, заявки и голосовые комнаты доступны."
-              f"\n🔔 Упоминания в новых заявках: {ping_summary}.")
+              f"\n🔔 Упоминания: {ping_summary}."
+              f"\n📞 Канал обзвона: {call_channel.mention if call_channel else 'не назначен'}."
+              f"\n👑 Обязательная роль: {common_role.name if common_role else 'не назначена'}.")
 
 
 @bot.tree.error
