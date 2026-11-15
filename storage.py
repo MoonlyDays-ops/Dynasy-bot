@@ -61,6 +61,9 @@ class Storage:
                 "ping_role_ids": "TEXT NOT NULL DEFAULT ''",
                 "call_channel_id": "INTEGER",
                 "common_role_id": "INTEGER",
+                "voice_log_channel_id": "INTEGER",
+                "application_panel_message_id": "INTEGER",
+                "voice_panel_message_id": "INTEGER",
             },
             "applications": {
                 "game_nick": "TEXT",
@@ -86,6 +89,11 @@ class Storage:
                WHERE status IN ('creating', 'pending', 'call_issuing', 'calling', 'processing')"""
         )
         self.conn.commit()
+
+    def configured_guild_ids(self) -> list[int]:
+        return [row[0] for row in self.conn.execute(
+            "SELECT guild_id FROM guild_config ORDER BY guild_id"
+        ).fetchall()]
 
     def config(self, guild_id: int):
         return self.conn.execute(
@@ -139,6 +147,49 @@ class Storage:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Сервер ещё не настроен")
+
+    def set_moderator_role(self, guild_id: int, role_id: int):
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE guild_config SET moderator_role_id = ? WHERE guild_id = ?",
+                (role_id, guild_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Сервер ещё не настроен")
+
+    def update_channel_ids(self, guild_id: int, **changes: int):
+        """Update only recognized channel IDs; never replace a whole guild config."""
+        allowed = {
+            "application_channel_id", "review_channel_id", "log_channel_id",
+            "control_channel_id", "lobby_channel_id", "voice_category_id",
+            "voice_log_channel_id", "application_panel_message_id", "voice_panel_message_id",
+        }
+        if not changes or any(name not in allowed for name in changes):
+            raise ValueError("Неизвестное поле настройки канала")
+        if any(not isinstance(value, int) or value <= 0 for value in changes.values()):
+            raise ValueError("ID канала или сообщения должен быть положительным числом")
+        assignments = ", ".join(f"{name} = ?" for name in changes)
+        with self.conn:
+            updated = self.conn.execute(
+                f"UPDATE guild_config SET {assignments} WHERE guild_id = ?",
+                (*changes.values(), guild_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Сервер ещё не настроен")
+
+    def expire_call_without_kick(self, app_id: int, now: int) -> bool:
+        """Atomically close an expired interview application without kicking a member.
+
+        Competes safely against a simultaneous moderator decision or voice arrival.
+        """
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE applications SET status = 'rejected', call_result = 'missed',
+                   call_deadline = NULL, reviewer_id = NULL, decided_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND status = 'calling' AND call_deadline <= ?""",
+                (app_id, now),
+            )
+        return updated.rowcount == 1
 
     def application_ping_role_ids(self, guild_id: int) -> list[int]:
         config = self.config(guild_id)
