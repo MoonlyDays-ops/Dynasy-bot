@@ -4,8 +4,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from family_storage import FamilyStorageMixin
 
-class Storage:
+
+class Storage(FamilyStorageMixin):
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
@@ -89,6 +91,7 @@ class Storage:
                WHERE status IN ('creating', 'pending', 'call_issuing', 'calling', 'processing')"""
         )
         self.conn.commit()
+        self.init_family_storage()
 
     def configured_guild_ids(self) -> list[int]:
         return [row[0] for row in self.conn.execute(

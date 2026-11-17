@@ -1,4 +1,4 @@
-"""Discord application approvals + self-managed temporary voice rooms.
+"""DYNASTY FAMILY: applications, voice rooms, capt roster and player profiles.
 
 Python 3.11+; discord.py 2.7.1. Start with: python bot.py
 """
@@ -18,6 +18,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from storage import Storage
+import family_features
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -557,6 +558,12 @@ class ReviewView(discord.ui.View):
                     await applicant.kick(reason=f"Заявка #{entry['id']} отклонена {interaction.user}")
                 decision = "rejected"
             self.bot.db.finish_application(entry["id"], decision, interaction.user.id)
+            if accepted:
+                # Profile only stores in-game details, never IRL name/age.
+                try:
+                    self.bot.db.upsert_profile_from_application(guild.id, entry["id"])
+                except (sqlite3.Error, ValueError):
+                    LOG.exception("Approved applicant profile sync failed; approval remains valid")
         except (discord.Forbidden, discord.HTTPException, RuntimeError) as exc:
             self.bot.db.revert_application(entry["id"])
             LOG.warning("Moderation failed: %s", exc)
@@ -906,6 +913,7 @@ class ApprovalVoiceBot(commands.Bot):
         self._rooms_reconciled = False
         self._legacy_commands_cleaned = False
         self._call_task: asyncio.Task | None = None
+        self._capt_task: asyncio.Task | None = None
 
     async def setup_hook(self):
         # Release operations left half-finished by a crashed previous process.
@@ -914,6 +922,8 @@ class ApprovalVoiceBot(commands.Bot):
         self.add_view(ApplicationPanelView(self))
         self.add_view(ReviewView(self))
         self.add_view(VoiceControlView(self))
+        family_features.register_persistent_views(self)
+        self._capt_task = asyncio.create_task(family_features.capt_reminder_loop(self), name="capt-reminders")
         self._call_task = asyncio.create_task(self.call_timeout_loop(), name="application-call-timeouts")
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -970,6 +980,12 @@ class ApprovalVoiceBot(commands.Bot):
                     LOG.exception("Unable to clean empty room %s", channel.id)
 
     async def close(self):
+        if self._capt_task and not self._capt_task.done():
+            self._capt_task.cancel()
+            try:
+                await self._capt_task
+            except asyncio.CancelledError:
+                pass
         if self._call_task and not self._call_task.done():
             self._call_task.cancel()
             try:
@@ -1210,6 +1226,7 @@ def config_overview(bot: "ApprovalVoiceBot", guild: discord.Guild) -> str:
             f"**Пульт комнат:** {channel_name('control_channel_id')}\n"
             f"**Журнал заявок:** {channel_name('log_channel_id')}\n"
             f"**Журнал комнат:** {channel_name('voice_log_channel_id')}\n\n"
+            f"**Капты:** {guild.get_channel(bot.db.capt_settings(guild.id)['channel_id']).mention if bot.db.capt_settings(guild.id)['channel_id'] and guild.get_channel(bot.db.capt_settings(guild.id)['channel_id']) else 'не настроены'}\n\n"
             "Выберите раздел ниже. Повторная публикация не затрагивает другие панели.")
 
 
@@ -1701,6 +1718,17 @@ class AdminHomeView(AdminOnlyView):
         await self.switch(i, "Выберите кандидата; сброс удалит активную заявку и её ветку.",
                           AdminResetView(self.bot, self.user_id))
 
+    @discord.ui.button(label="⚔️ Капт-состав", style=discord.ButtonStyle.primary, row=2)
+    async def capt_menu(self, i: discord.Interaction, _: discord.ui.Button):
+        await self.switch(
+            i, "⚔️ **DYNASTY • Majestic RP Miami**\nКапт-состав, сбор, резерв, явка, откаты и статистика.\n"
+               "Первым делом нажмите «Создать каналы», затем назначьте роль капитана.",
+            family_features.CaptsAdminView(
+                self.bot, self.user_id,
+                back_factory=lambda: AdminHomeView(self.bot, self.user_id),
+            ),
+        )
+
     @discord.ui.button(label="🔄 Обновить статус", style=discord.ButtonStyle.secondary, row=2)
     async def status(self, i: discord.Interaction, _: discord.ui.Button):
         await i.response.edit_message(content=config_overview(self.bot, i.guild), view=self)
@@ -1708,6 +1736,7 @@ class AdminHomeView(AdminOnlyView):
 
 
 bot = ApprovalVoiceBot()
+family_features.register_slash_commands(bot)
 
 
 @bot.tree.command(name="setup_server", description="Первичная настройка заявок и временных голосовых комнат")
