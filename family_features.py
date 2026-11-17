@@ -1,4 +1,4 @@
-"""DYNASTY FAMILY v6 — Majestic RP Miami capts + private player profiles.
+"""DYNASTY FAMILY v8 — Majestic RP Miami capts, profiles, achievements.
 
 No game API or automated capture detection: results, participation and clips are
 based on users' submissions and confirmation by the capt leader/administrator.
@@ -9,12 +9,15 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime, time as dt_time, timedelta
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord import app_commands
+
+from family_rewards import (EMBED_GREEN, achievement_progress, earned_achievements,
+                            progress_bar, due_reminder_minutes)
 
 LOG = logging.getLogger("dynasty.capts")
 
@@ -24,7 +27,7 @@ def clean(value: str, limit: int = 1000) -> str:
 
 
 async def reply(interaction: discord.Interaction, message: str, *, embed=None, view=None):
-    opts = dict(ephemeral=True)
+    opts = dict(ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     if embed is not None:
         opts["embed"] = embed
     if view is not None:
@@ -77,11 +80,33 @@ def checked_url(url: str) -> bool:
         return False
 
 
+def achievements_embed(member: discord.Member, stats: dict) -> discord.Embed:
+    unlocked = earned_achievements(stats)
+    embed = discord.Embed(
+        title="🏅 DYNASTY • Достижения",
+        description=(f"**Игрок:** {member.mention}\n"
+                     f"**Открыто:** {len(unlocked)}/{len(achievement_progress(stats))}\n"
+                     "Награды рассчитываются по подтверждённой явке, результатам и откатам."),
+        color=EMBED_GREEN,
+    )
+    for achievement, current in achievement_progress(stats):
+        achieved = current >= achievement.threshold
+        progress = f"{current}/{achievement.threshold}"
+        embed.add_field(
+            name=f"{'✅' if achieved else '🔒'} {achievement.icon} {achievement.title}",
+            value=(f"{achievement.description}\n"
+                   f"{progress_bar(current, achievement.threshold, width=8)}  **{progress}**"),
+            inline=False,
+        )
+    embed.set_footer(text="Достижения не выдают Discord-роли и не используют данные игры напрямую")
+    return embed
+
+
 def profile_embed(bot, member: discord.Member) -> discord.Embed:
     p = bot.db.profile(member.guild.id,member.id)
     stats = bot.db.profile_stats(member.guild.id,member.id)
     approved_dir = direction_from_roles(bot,member)
-    embed = discord.Embed(title="👑 DYNASTY • Личный кабинет", color=discord.Color.gold())
+    embed = discord.Embed(title="👑 DYNASTY • Личный кабинет", color=EMBED_GREEN)
     embed.description = (f"**Участник:** {member.mention}\n"
                          f"**Ник на Majestic RP Miami:** {clean(p['game_nick']) if p else 'Не указан'}\n"
                          f"**Статик #:** {p['static_number'] if p else 'Не указан'}\n"
@@ -92,15 +117,11 @@ def profile_embed(bot, member: discord.Member) -> discord.Embed:
     embed.add_field(name="❌ Поражения", value=str(stats["losses"]), inline=True)
     embed.add_field(name="📅 Будущие капты в основном", value=str(stats["upcoming"]), inline=True)
     embed.add_field(name="🎥 Принято откатов", value=str(stats["approved_clips"]), inline=True)
-    if stats["attended"] >= 20:
-        achievement = "🥇 Ветеран каптов"
-    elif stats["attended"] >= 10:
-        achievement = "🥈 Постоянный боец"
-    elif stats["attended"] >= 3:
-        achievement = "🥉 Активный участник"
-    else:
-        achievement = "Пока без достижений"
-    embed.add_field(name="🎖️ Достижение", value=achievement, inline=False)
+    earned = earned_achievements(stats)
+    preview = "\n".join(f"{a.icon} **{a.title}**" for a in earned[-4:]) if earned else "Пока нет достижений"
+    embed.add_field(name=f"🎖️ Достижения ({len(earned)}/{len(achievement_progress(stats))})",
+                    value=preview + "\nНажмите «Достижения», чтобы посмотреть все награды и прогресс.",
+                    inline=False)
     embed.set_footer(text="Учитывается только явка, подтверждённая руководством • контракты не учитываются")
     return embed
 
@@ -118,9 +139,12 @@ def event_embed(bot, event) -> discord.Embed:
                                     f"**Время:** <t:{event['scheduled_at']}:F> (<t:{event['scheduled_at']}:R>)\n"
                                     f"**Капт-лидер:** <@{event['created_by']}>\n"
                                     f"**Статус:** {status}"),
-                       color=discord.Color.gold() if event["status"] == "scheduled" else discord.Color.greyple())
+                       color=EMBED_GREEN if event["status"] in ("scheduled", "finished") else discord.Color.greyple())
     main_list = ", ".join(f"<@{r['user_id']}>" for r in mains[:16]) or "Пока никого"
     reserve_list = ", ".join(f"<@{r['user_id']}>" for r in reserve[:12]) or "Пусто"
+    em.add_field(name="🟩 Заполнение основного состава",
+                 value=(f"{progress_bar(len(mains),event['capacity'])} "
+                        f"**{len(mains)}/{event['capacity']}**"),inline=False)
     em.add_field(name=f"Основной состав ({len(mains)}/{event['capacity']})",
                  value=main_list[:1024], inline=False)
     em.add_field(name=f"Резерв ({len(reserve)})",value=reserve_list[:1024],inline=False)
@@ -215,86 +239,306 @@ class ProfileView(discord.ui.View):
             lines.append(f"**#{r['id']}** • <t:{r['scheduled_at']}:f> • {clean(r['opponent'],50)} • {r['choice']} • {status}")
         await reply(i,"📅 **Ваши последние капты**\n"+"\n".join(lines))
 
+    @discord.ui.button(label="🏅 Достижения",style=discord.ButtonStyle.secondary)
+    async def achievements(self,i,_):
+        stats=self.bot.db.profile_stats(i.guild.id,i.user.id)
+        embed=achievements_embed(i.user,stats)
+        await reply(i,"Ваши достижения (доступны только вам):",embed=embed)
+
     @discord.ui.button(label="Обновить",style=discord.ButtonStyle.success)
     async def refresh(self,i,_):
         await i.response.edit_message(embed=profile_embed(self.bot,i.user),view=self)
 
 
+# The Discord API exposes dropdowns, but not a native calendar/date picker.
+# A 25-day paginated date select avoids manual date entry entirely.
+CAPT_DATE_PAGE_SIZE = 25
+CAPT_DATE_MAX_DAYS = 365
+RUS_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+CAPT_RESULT_NAMES = {"win": "Победа", "loss": "Поражение", "draw": "Ничья"}
+
+
+def capt_schedule_timestamp(day: date, hour: int, minute: int, zone: ZoneInfo, *, now: int | None = None) -> int:
+    """Validate the chosen local time, including DST gaps, and return Unix seconds."""
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError("Некорректное время.")
+    local = datetime.combine(day, dt_time(hour=hour, minute=minute))
+    stamp = int(local.replace(tzinfo=zone).timestamp())
+    if datetime.fromtimestamp(stamp, zone).replace(tzinfo=None) != local:
+        raise ValueError("В этот день выбранное время отсутствует из-за перевода часов. Выберите другое.")
+    if stamp <= (int(time.time()) if now is None else now) + 120:
+        raise ValueError("Выберите время минимум через две минуты от текущего.")
+    return stamp
+
+
+async def publish_new_capt(bot, i: discord.Interaction, details: dict, timestamp: int):
+    """Reuse the existing DB and announcement semantics after calendar selection."""
+    conf = bot.db.capt_settings(i.guild.id)
+    channel = i.guild.get_channel(conf["channel_id"]) if conf["channel_id"] else None
+    if not isinstance(channel, discord.TextChannel):
+        raise ValueError("Сначала создайте каналы: /menu → Капт-состав → Создать каналы.")
+    event_id = bot.db.create_capt(
+        i.guild.id, i.user.id, details["opponent"], details["location"],
+        details["format_text"], timestamp, details["capacity"]
+    )
+    try:
+        event = bot.db.capt_event(event_id)
+        ping_role = i.guild.get_role(conf["announce_role_id"]) if conf["announce_role_id"] else None
+        content = (f"📣 **Новый капт DYNASTY!** {ping_role.mention}" if ping_role
+                   else "📣 **Новый капт DYNASTY!**")
+        msg = await channel.send(
+            content=content, embed=event_embed(bot, event), view=CaptEventView(bot),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, users=False, roles=[ping_role] if ping_role else False,
+                replied_user=False,
+            ),
+        )
+        bot.db.attach_capt_event(event_id, channel.id, msg.id)
+    except discord.HTTPException:
+        bot.db.delete_unpublished_capt(event_id)
+        LOG.exception("Failed creating capt event")
+        raise
+    await capt_log(bot, i.guild, "Создан капт",
+                   f"Капт **#{event_id}** • {clean(event['opponent'])} • <t:{timestamp}:F> • <@{i.user.id}>")
+    return event_id, channel
+
+
 class CaptCreateModal(discord.ui.Modal, title="DYNASTY • Создать капт"):
-    opponent=discord.ui.TextInput(label="Противник",max_length=100)
-    location=discord.ui.TextInput(label="Место / квадрат",max_length=100)
-    format_text=discord.ui.TextInput(label="Формат (пример: 15x15)",max_length=100)
-    time_text=discord.ui.TextInput(label="Дата и время: ДД.ММ.ГГГГ ЧЧ:ММ",placeholder="18.11.2026 20:30",max_length=16)
-    capacity=discord.ui.TextInput(label="Мест в основном составе (1–100)",placeholder="15",max_length=3)
+    opponent = discord.ui.TextInput(label="Противник", max_length=100)
+    location = discord.ui.TextInput(label="Место / квадрат", max_length=100)
+    format_text = discord.ui.TextInput(label="Формат (пример: 15x15)", max_length=100)
+    capacity = discord.ui.TextInput(label="Мест в основном составе (1–100)", placeholder="15", max_length=3)
 
-    def __init__(self,bot):
+    def __init__(self, bot):
         super().__init__(timeout=300)
-        self.bot=bot
+        self.bot = bot
 
-    async def on_submit(self,i:discord.Interaction):
-        if not isinstance(i.user,discord.Member) or not can_manage_capts(self.bot,i.user):
-            return await reply(i,"Только капитан или администратор может создавать капты.")
-        conf=self.bot.db.capt_settings(i.guild.id)
-        channel=i.guild.get_channel(conf["channel_id"]) if conf["channel_id"] else None
-        if not isinstance(channel,discord.TextChannel):
-            return await reply(i,"Сначала настройте модуль: /menu → Капт-состав → Создать каналы.")
+    async def on_submit(self, i: discord.Interaction):
+        if (i.guild is None or not isinstance(i.user, discord.Member)
+                or not can_manage_capts(self.bot, i.user)):
+            return await reply(i, "Только капитан или администратор может создавать капты.")
         try:
-            zone=ZoneInfo(conf["timezone"])
-            local=datetime.strptime(str(self.time_text.value).strip(),"%d.%m.%Y %H:%M")
-            timestamp=int(local.replace(tzinfo=zone).timestamp())
-            if timestamp <= time.time()-60:
-                raise ValueError("Дата капта уже прошла")
-            capacity=int(str(self.capacity.value).strip())
+            capacity = int(str(self.capacity.value).strip())
             if not 1 <= capacity <= 100:
-                raise ValueError("Вместимость должна быть от 1 до 100")
-        except (ValueError,ZoneInfoNotFoundError) as exc:
-            return await reply(i,f"❌ Неверная дата/время/места. Используйте ДД.ММ.ГГГГ ЧЧ:ММ. {exc}")
-        await i.response.defer(ephemeral=True,thinking=True)
-        event_id=self.bot.db.create_capt(i.guild.id,i.user.id,str(self.opponent.value),
-                                          str(self.location.value),str(self.format_text.value),timestamp,capacity)
+                raise ValueError("Вместимость должна быть от 1 до 100.")
+            details = dict(opponent=str(self.opponent.value).strip(),
+                           location=str(self.location.value).strip(),
+                           format_text=str(self.format_text.value).strip(),
+                           capacity=capacity)
+            if not all(details.values()):
+                raise ValueError("Заполните все поля.")
+            picker = CaptScheduleView(self.bot, i.user.id, i.guild.id, details)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            return await reply(i, f"❌ {exc}")
+        await i.response.send_message(
+            picker.summary(), view=picker, ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class CaptDaySelect(discord.ui.Select):
+    def __init__(self, picker: "CaptScheduleView"):
+        self.picker = picker
+        first = picker.today + timedelta(days=picker.page_offset)
+        last = picker.today + timedelta(days=CAPT_DATE_MAX_DAYS)
+        options = []
+        for offset in range(CAPT_DATE_PAGE_SIZE):
+            day = first + timedelta(days=offset)
+            if day > last:
+                break
+            options.append(discord.SelectOption(
+                label=f"{day:%d.%m.%Y} • {RUS_WEEKDAYS[day.weekday()]}",
+                value=day.isoformat(), default=day == picker.selected_date,
+            ))
+        super().__init__(placeholder="📅 Выберите дату капта", options=options, row=0)
+
+    async def callback(self, i: discord.Interaction):
+        self.picker.selected_date = date.fromisoformat(self.values[0])
+        self.picker.rebuild()
+        await i.response.edit_message(content=self.picker.summary(), view=self.picker)
+
+
+class CaptHourSelect(discord.ui.Select):
+    def __init__(self, picker: "CaptScheduleView"):
+        self.picker = picker
+        options = [discord.SelectOption(label=f"{h:02d}:00", value=str(h),
+                                        default=h == picker.hour) for h in range(24)]
+        super().__init__(placeholder="🕒 Часы", options=options, row=1)
+
+    async def callback(self, i: discord.Interaction):
+        self.picker.hour = int(self.values[0])
+        self.picker.rebuild()
+        await i.response.edit_message(content=self.picker.summary(), view=self.picker)
+
+
+class CaptMinuteSelect(discord.ui.Select):
+    def __init__(self, picker: "CaptScheduleView"):
+        self.picker = picker
+        options = [discord.SelectOption(label=f"{m:02d} мин", value=str(m),
+                                        default=m == picker.minute) for m in range(0, 60, 5)]
+        super().__init__(placeholder="⏱️ Минуты (шаг 5 минут)", options=options, row=2)
+
+    async def callback(self, i: discord.Interaction):
+        self.picker.minute = int(self.values[0])
+        self.picker.rebuild()
+        await i.response.edit_message(content=self.picker.summary(), view=self.picker)
+
+
+class CaptScheduleNav(discord.ui.Button):
+    def __init__(self, picker: "CaptScheduleView", direction: int):
+        self.picker = picker
+        self.direction = direction
+        super().__init__(label="← Предыдущие даты" if direction < 0 else "Следующие даты →",
+                         style=discord.ButtonStyle.secondary, row=3,
+                         disabled=(picker.page_offset == 0 if direction < 0 else
+                                   picker.page_offset + CAPT_DATE_PAGE_SIZE > CAPT_DATE_MAX_DAYS))
+
+    async def callback(self, i: discord.Interaction):
+        self.picker.page_offset = max(0, min(CAPT_DATE_MAX_DAYS,
+                                     self.picker.page_offset + self.direction * CAPT_DATE_PAGE_SIZE))
+        # Select the first day of the visible page to avoid invisible selections.
+        self.picker.selected_date = self.picker.today + timedelta(days=self.picker.page_offset)
+        self.picker.rebuild()
+        await i.response.edit_message(content=self.picker.summary(), view=self.picker)
+
+
+class CaptScheduleConfirm(discord.ui.Button):
+    def __init__(self, picker: "CaptScheduleView"):
+        self.picker = picker
+        super().__init__(label="✅ Опубликовать капт", style=discord.ButtonStyle.success, row=3)
+
+    async def callback(self, i: discord.Interaction):
+        picker = self.picker
+        if picker.saving:
+            return await reply(i, "Публикация уже выполняется.")
         try:
-            event=self.bot.db.capt_event(event_id)
-            msg=await channel.send(embed=event_embed(self.bot,event),view=CaptEventView(self.bot),
-                                   allowed_mentions=discord.AllowedMentions.none())
-            self.bot.db.attach_capt_event(event_id,channel.id,msg.id)
-        except discord.HTTPException as exc:
-            self.bot.db.delete_unpublished_capt(event_id)
-            LOG.exception("Failed creating capt event")
-            return await reply(i,f"❌ Не удалось опубликовать капт: {exc}")
-        await capt_log(self.bot,i.guild,"Создан капт",
-                       f"Капт **#{event_id}** • {clean(event['opponent'])} • <t:{timestamp}:F> • <@{i.user.id}>")
-        await reply(i,f"✅ Капт **#{event_id}** опубликован в {channel.mention}. Время отображается по часовому поясу каждого участника.")
+            timestamp = capt_schedule_timestamp(picker.selected_date, picker.hour,
+                                                picker.minute, picker.zone)
+        except ValueError as exc:
+            return await reply(i, f"❌ {exc}")
+        picker.saving = True
+        await i.response.defer()  # acknowledges button without displaying a public message
+        try:
+            event_id, channel = await publish_new_capt(picker.bot, i, picker.details, timestamp)
+        except (ValueError, discord.HTTPException) as exc:
+            picker.saving = False
+            return await i.edit_original_response(content=f"❌ Ошибка публикации: {exc}", view=picker)
+        await i.edit_original_response(
+            content=f"✅ Капт **#{event_id}** опубликован в {channel.mention} на <t:{timestamp}:F>.",
+            view=None,
+        )
 
 
-class CaptFinishModal(discord.ui.Modal,title="DYNASTY • Результат капта"):
-    result=discord.ui.TextInput(label="Результат: Победа / Поражение / Ничья",max_length=15)
-    replay=discord.ui.TextInput(label="Ссылка на запись (необязательно)",required=False,max_length=500)
-    comment=discord.ui.TextInput(label="Комментарий (необязательно)",required=False,max_length=600,
-                                  style=discord.TextStyle.paragraph)
+class CaptScheduleView(discord.ui.View):
+    """User-scoped date/time picker; all responses remain ephemeral."""
+    def __init__(self, bot, owner_id: int, guild_id: int, details: dict):
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.details = details
+        conf = bot.db.capt_settings(guild_id)
+        self.zone = ZoneInfo(conf["timezone"])
+        now = datetime.now(self.zone)
+        suggested = now + timedelta(hours=1)
+        # Round proposed time upward to a five-minute boundary.
+        rounded = suggested + timedelta(minutes=(5 - suggested.minute % 5) % 5)
+        self.today = now.date()
+        self.selected_date = rounded.date()
+        self.hour = rounded.hour
+        self.minute = rounded.minute
+        self.page_offset = 0
+        self.saving = False
+        self.rebuild()
 
-    def __init__(self,bot,event_id):
-        super().__init__(timeout=300); self.bot=bot; self.event_id=event_id
+    def rebuild(self):
+        self.clear_items()
+        self.add_item(CaptDaySelect(self))
+        self.add_item(CaptHourSelect(self))
+        self.add_item(CaptMinuteSelect(self))
+        self.add_item(CaptScheduleNav(self, -1))
+        self.add_item(CaptScheduleNav(self, 1))
+        self.add_item(CaptScheduleConfirm(self))
 
-    async def on_submit(self,i:discord.Interaction):
-        if not isinstance(i.user,discord.Member) or not can_manage_capts(self.bot,i.user):
-            return await reply(i,"Недостаточно прав для завершения капта.")
-        result={"победа":"win","выиграли":"win","win":"win","поражение":"loss",
-                "проиграли":"loss","loss":"loss","ничья":"draw","draw":"draw"}.get(str(self.result.value).strip().lower())
-        link=str(self.replay.value).strip()
-        if result is None or not checked_url(link):
-            return await reply(i,"Укажите результат Победа / Поражение / Ничья; ссылка должна начинаться с https://")
-        event=self.bot.db.capt_event(self.event_id)
+    def summary(self) -> str:
+        return ("📅 **DYNASTY • Выберите дату и время капта**\n"
+                f"Противник: **{clean(self.details['opponent'])}** • "
+                f"Мест: **{self.details['capacity']}**\n"
+                f"Дата: **{self.selected_date:%d.%m.%Y}** • "
+                f"Время: **{self.hour:02d}:{self.minute:02d}** "
+                f"(`{self.zone.key}`)\n"
+                "Выберите день, час и минуты из списков, затем нажмите «Опубликовать капт». "
+                "Для дальних дат используйте кнопки навигации.")
+
+    async def interaction_check(self, i: discord.Interaction) -> bool:
+        if (i.guild is None or i.guild.id != self.guild_id or i.user.id != self.owner_id
+                or not isinstance(i.user, discord.Member) or not can_manage_capts(self.bot, i.user)):
+            await reply(i, "⛔ Это меню доступно только капитану, который его открыл.")
+            return False
+        return True
+
+
+class CaptFinishModal(discord.ui.Modal):
+    replay = discord.ui.TextInput(label="Ссылка на запись (необязательно)", required=False, max_length=500)
+    comment = discord.ui.TextInput(label="Комментарий (необязательно)", required=False, max_length=600,
+                                   style=discord.TextStyle.paragraph)
+
+    def __init__(self, bot, event_id: int, result_code: str):
+        if result_code not in CAPT_RESULT_NAMES:
+            raise ValueError("Неизвестный результат капта")
+        super().__init__(title=f"DYNASTY • {CAPT_RESULT_NAMES[result_code]}", timeout=300)
+        self.bot = bot
+        self.event_id = event_id
+        self.result_code = result_code
+
+    async def on_submit(self, i: discord.Interaction):
+        if (i.guild is None or not isinstance(i.user, discord.Member)
+                or not can_manage_capts(self.bot, i.user)):
+            return await reply(i, "Недостаточно прав для завершения капта.")
+        link = str(self.replay.value).strip()
+        if not checked_url(link):
+            return await reply(i, "❌ Ссылка должна начинаться с https://")
+        event = self.bot.db.capt_event(self.event_id)
         if not event or event["guild_id"] != i.guild.id or not self.bot.db.finish_capt(
-                self.event_id,result,link,str(self.comment.value)):
-            return await reply(i,"Капт уже завершён или недоступен.")
-        await i.response.defer(ephemeral=True,thinking=True)
-        await redraw_event(self.bot,i.guild,self.event_id)
-        count=sum(s["attended"]==1 for s in self.bot.db.capt_signups(self.event_id))
-        await capt_log(self.bot,i.guild,"Капт завершён",
-                       f"#{self.event_id} • результат **{clean(str(self.result.value))}** • явка: **{count}** • лидер <@{i.user.id}>"
-                       +(f"\nЗапись: {link}" if link else ""))
-        await reply(i,"✅ Результат записан. Статистика профилей учитывает только участников, которым капитан подтвердил явку.")
+                self.event_id, self.result_code, link, str(self.comment.value)):
+            return await reply(i, "Капт уже завершён или недоступен.")
+        await i.response.defer(ephemeral=True, thinking=True)
+        await redraw_event(self.bot, i.guild, self.event_id)
+        count = sum(s["attended"] == 1 for s in self.bot.db.capt_signups(self.event_id))
+        await capt_log(self.bot, i.guild, "Капт завершён",
+                       f"#{self.event_id} • результат **{CAPT_RESULT_NAMES[self.result_code]}** "
+                       f"• явка: **{count}** • лидер <@{i.user.id}>"
+                       + (f"\nЗапись: {link}" if link else ""))
+        await reply(i, "✅ Результат записан. Статистика профилей учитывает только участников, которым капитан подтвердил явку.")
 
+
+class CaptResultSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="Выберите результат капта", min_values=1, max_values=1,
+                         options=[discord.SelectOption(label="Победа", value="win", emoji="🏆"),
+                                  discord.SelectOption(label="Поражение", value="loss", emoji="❌"),
+                                  discord.SelectOption(label="Ничья", value="draw", emoji="🤝")])
+
+    async def callback(self, i: discord.Interaction):
+        view = self.view
+        event = view.bot.db.capt_event(view.event_id)
+        if (not event or event["guild_id"] != i.guild.id or event["status"] != "scheduled"):
+            return await reply(i, "Капт уже завершён или недоступен.")
+        await i.response.send_modal(CaptFinishModal(view.bot, view.event_id, self.values[0]))
+
+
+class CaptFinishChoiceView(discord.ui.View):
+    def __init__(self, bot, event_id: int, owner_id: int):
+        super().__init__(timeout=300)
+        self.bot, self.event_id, self.owner_id = bot, event_id, owner_id
+        self.add_item(CaptResultSelect())
+
+    async def interaction_check(self, i: discord.Interaction):
+        if (i.guild is None or i.user.id != self.owner_id
+                or not isinstance(i.user, discord.Member) or not can_manage_capts(self.bot, i.user)):
+            await reply(i, "⛔ Только капитан, открывший список, может выбрать результат.")
+            return False
+        return True
 
 class CaptClipModal(discord.ui.Modal,title="DYNASTY • Сдать откат"):
     url=discord.ui.TextInput(label="Ссылка на запись/видео (https://)",max_length=400)
@@ -531,7 +775,8 @@ class CaptEventView(discord.ui.View):
     async def finish(self,i,_):
         event=await self.locate(i)
         if event and event["status"]=="scheduled" and isinstance(i.user,discord.Member) and can_manage_capts(self.bot,i.user):
-            await i.response.send_modal(CaptFinishModal(self.bot,event["id"]))
+            await reply(i, "🏁 Выберите результат капта из списка. Затем можно добавить запись и комментарий.",
+                        view=CaptFinishChoiceView(self.bot, event["id"], i.user.id))
         elif event:
             await reply(i,"Нет прав или капт уже закрыт.")
 
@@ -624,9 +869,20 @@ class CaptHubView(discord.ui.View):
         rows=self.bot.db.family_leaderboard(i.guild.id)
         if not rows:
             return await reply(i,"Пока нет подтверждённой явки на завершённые капты.")
-        lines=[f"**{n}.** {clean(r['game_nick'] or str(r['user_id']),60)} • посещено {r['attended']} • побед {r['wins']}"
-               for n,r in enumerate(rows,1)]
-        await reply(i,"🏆 **Рейтинг DYNASTY (подтверждённая явка)**\n"+"\n".join(lines))
+        lines=[]
+        for position,r in enumerate(rows,1):
+            # A Discord user mention, not a bare ID. Suppress notifications
+            # while still rendering the user's nickname in the interface.
+            mention=f"<@{r['user_id']}>"
+            nick=f" ({clean(r['game_nick'],40)})" if r['game_nick'] else ""
+            medal={1:"🥇",2:"🥈",3:"🥉"}.get(position,f"**{position}.**")
+            badges=len(earned_achievements(self.bot.db.profile_stats(i.guild.id,r['user_id'])))
+            lines.append(f"{medal} {mention}{nick} — **{r['attended']}** явок, "
+                         f"**{r['wins']}** побед, 🏅 {badges}")
+        em=discord.Embed(title="🏆 DYNASTY • Рейтинг капт-состава",
+                         description="\n".join(lines),color=EMBED_GREEN)
+        em.set_footer(text="Только подтверждённая явка на завершённые капты")
+        await reply(i,"Рейтинг участников:",embed=em)
 
     @discord.ui.button(label="Создать капт",style=discord.ButtonStyle.success,
                        custom_id="dynasty:capt:create")
@@ -648,7 +904,7 @@ async def publish_capt_hub(bot,guild:discord.Guild):
                                   "👑 Профиль и статистику смотрите через «Личный кабинет».\n"
                                   "⚙️ Капт-лидер может создать капт через кнопку ниже.\n\n"
                                   "Данные о посещаемости и результатах подтверждает руководство."),
-                     color=discord.Color.gold())
+                     color=EMBED_GREEN)
     old=conf["hub_message_id"]
     if old:
         try: await (await channel.fetch_message(old)).delete()
@@ -739,6 +995,39 @@ class CaptLeaderSettingsView(discord.ui.View):
     async def interaction_check(self,i):
         if i.user.id!=self.owner_id or not isinstance(i.user,discord.Member) or not i.user.guild_permissions.administrator:
             await reply(i,"Меню доступно только администратору, который его открыл."); return False
+        return True
+
+
+class CaptAnnouncementRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="Роль для анонса новых каптов",min_values=1,max_values=1,row=0)
+
+    async def callback(self,i:discord.Interaction):
+        if not isinstance(i.user,discord.Member) or not i.user.guild_permissions.administrator:
+            return await reply(i,"Настройка доступна только администратору.")
+        role=self.values[0]
+        if role.is_default():
+            return await reply(i,"Нужно выбрать отдельную роль, а не @everyone.")
+        self.view.bot.db.set_capt_settings(i.guild.id, announce_role_id=role.id)
+        can_ping = role.mentionable or (i.guild.me is not None and
+                                       i.guild.me.guild_permissions.mention_everyone)
+        notice=("Бот сможет уведомлять участников роли."
+                if can_ping else
+                "⚠️ Роль не допускает упоминания. Разрешите ей упоминания в настройках роли "
+                "или выдайте боту право «Упоминать @everyone, @here и все роли».")
+        await reply(i,f"✅ Роль анонсов: {role.mention}. {notice}")
+
+
+class CaptAnnouncementRoleSettingsView(discord.ui.View):
+    def __init__(self,bot,owner_id):
+        super().__init__(timeout=600); self.bot=bot; self.owner_id=owner_id
+        self.add_item(CaptAnnouncementRoleSelect())
+
+    async def interaction_check(self,i):
+        if (i.user.id != self.owner_id or not isinstance(i.user,discord.Member)
+                or not i.user.guild_permissions.administrator):
+            await reply(i,"Меню доступно только администратору, который его открыл.")
+            return False
         return True
 
 
@@ -858,21 +1147,31 @@ class CaptsAdminView(discord.ui.View):
         await reply(i,"📊 **Ближайшие капты:**\n"+("\n".join(lines) if lines else "Нет")+
                     "\n\n🏆 **Топ по явке:**\n"+("\n".join(top) if top else "Нет"))
 
+    @discord.ui.button(label="📣 Роль анонсов",style=discord.ButtonStyle.primary,row=3)
+    async def announce_role(self,i,_):
+        await i.response.edit_message(
+            content="Выберите одну роль, которую бот будет упоминать при публикации нового капта.",
+            view=CaptAnnouncementRoleSettingsView(self.bot,self.owner_id))
+
     @discord.ui.button(label="← Главное меню",style=discord.ButtonStyle.secondary,row=4)
     async def back(self,i,_):
         await i.response.edit_message(content="🛠️ DYNASTY • Меню администратора",view=self.back_factory())
 
 
 async def capt_reminder_loop(bot):
-    """Persistent reminders 30/15/5 minutes before capts; no spam after restart."""
+    """Announce capts 30/15/5 minutes before start; idempotent across restarts.
+
+    Notifications go to the capt channel with mentions of the actual main
+    roster, plus best-effort DM to each main participant. No pings are sent to
+    the entire role on every reminder (role receives the initial announcement).
+    """
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
             now=int(time.time())
             for event in bot.db.due_capt_reminders(now):
-                remain=event["scheduled_at"]-now
-                minutes=5 if remain<=5*60 else 15 if remain<=15*60 else 30
-                if not bot.db.claim_capt_reminder(event["id"],minutes):
+                minutes=due_reminder_minutes(event["scheduled_at"],now)
+                if minutes is None or not bot.db.claim_capt_reminder(event["id"],minutes):
                     continue
                 guild=bot.get_guild(event["guild_id"])
                 channel=guild.get_channel(event["channel_id"]) if guild and event["channel_id"] else None
@@ -882,20 +1181,43 @@ async def capt_reminder_loop(bot):
                 mains=bot.db.capt_signups(event["id"],"main")
                 conf=bot.db.capt_settings(guild.id)
                 voice=guild.get_channel(conf["voice_channel_id"]) if conf["voice_channel_id"] else None
-                users=" ".join(f"<@{r['user_id']}>" for r in mains[:40])
-                actual_remaining=max(1,(remain+59)//60)
-                content=(f"⏰ **Капт #{event['id']}: до начала ~{actual_remaining} мин.** "
-                         f"Противник: {clean(event['opponent'],80)}. "
-                         f"Сбор: {voice.mention if voice else 'согласуйте с капитаном'}.\n{users}")
+                participants=[r["user_id"] for r in mains]
+                link=(f"https://discord.com/channels/{guild.id}/{event['channel_id']}/"
+                      f"{event['message_id']}")
+                headline=f"⏰ **До капта #{event['id']} — {minutes} минут!**"
+                body=(f"Противник: **{clean(event['opponent'],80)}**. "
+                      f"Сбор: {voice.mention if voice else 'уточните у капитана'}.\n"
+                      f"Карточка капта: {link}")
                 try:
-                    await channel.send(content[:1950],
-                                       allowed_mentions=discord.AllowedMentions(everyone=False,roles=False,users=True))
+                    # Full roster can exceed Discord's 2000-character limit.
+                    # Mention main participants in batches of up to 30 users.
+                    await channel.send(headline+"\n"+body,
+                        allowed_mentions=discord.AllowedMentions.none())
+                    for begin in range(0,len(participants),30):
+                        selected=participants[begin:begin+30]
+                        await channel.send("🔔 Основной состав: "+" ".join(f"<@{uid}>" for uid in selected),
+                            allowed_mentions=discord.AllowedMentions(
+                                everyone=False,roles=False,
+                                users=[discord.Object(id=uid) for uid in selected],
+                                replied_user=False))
                 except discord.HTTPException:
                     bot.db.release_capt_reminder(event["id"],minutes)
-                    LOG.exception("Could not send capt reminder %s",event["id"])
+                    LOG.exception("Could not send capt reminder %s (%sm)",event["id"],minutes)
+                    continue
+                # DMs are helpful but optional; privacy settings may forbid them.
+                # The public reminder remains delivered even if a DM fails.
+                for user_id in participants:
+                    try:
+                        member=guild.get_member(user_id)
+                        if member is None:
+                            member=await bot.fetch_user(user_id)
+                        await member.send(f"⏰ DYNASTY FAMILY: до капта #{event['id']} "
+                                          f"осталось {minutes} минут!\n"+body)
+                    except discord.HTTPException:
+                        LOG.info("Could not DM capt reminder to %s",user_id)
         except Exception:
             LOG.exception("Capt reminder loop error")
-        await asyncio.sleep(30)
+        await asyncio.sleep(25)
 
 
 def register_slash_commands(bot):
