@@ -1,4 +1,4 @@
-"""Majestic RP Miami: family profiles, capt roster, attendance, clips (SQLite).
+"""Majestic RP Miami: profiles, capts, reminders, badges (SQLite).
 
 This mixin deliberately shares the SAME connection/transaction as the legacy bot.
 No schema or records from v5 are deleted.
@@ -29,6 +29,7 @@ class FamilyStorageMixin:
                     log_channel_id INTEGER,
                     clips_channel_id INTEGER,
                     leader_role_id INTEGER,
+                    announce_role_id INTEGER,
                     voice_channel_id INTEGER,
                     hub_message_id INTEGER,
                     timezone TEXT NOT NULL DEFAULT 'Europe/Moscow'
@@ -85,6 +86,11 @@ class FamilyStorageMixin:
                 CREATE INDEX IF NOT EXISTS idx_capt_clips_user
                     ON capt_clips(guild_id,user_id,status);
             """)
+            # Safe upgrade from v6: add the separate role to ping when a capt
+            # is created. The existing capts, signups and settings are untouched.
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(capt_settings)")}
+            if "announce_role_id" not in columns:
+                self.conn.execute("ALTER TABLE capt_settings ADD COLUMN announce_role_id INTEGER")
 
     # --- Per-server capt configuration ------------------------------------
     def capt_settings(self, guild_id: int):
@@ -94,7 +100,7 @@ class FamilyStorageMixin:
 
     def set_capt_settings(self, guild_id: int, **values):
         allowed = {"channel_id", "log_channel_id", "clips_channel_id",
-                   "leader_role_id", "voice_channel_id", "hub_message_id", "timezone"}
+                   "leader_role_id", "announce_role_id", "voice_channel_id", "hub_message_id", "timezone"}
         if not values or set(values) - allowed:
             raise ValueError("Неизвестная настройка каптов")
         fields = ", ".join(f"{key}=?" for key in values)
@@ -262,10 +268,22 @@ class FamilyStorageMixin:
             ORDER BY scheduled_at ASC LIMIT ?""", (guild_id, limit)).fetchall()
 
     def due_capt_reminders(self, now: int):
-        return self.conn.execute("""SELECT * FROM capt_events WHERE status='scheduled'
-            AND scheduled_at >= ? AND scheduled_at <= ? AND message_id IS NOT NULL
-            ORDER BY scheduled_at ASC LIMIT 50""",
-            (now,now+30*60)).fetchall()
+        """Candidate events near a 30/15/5-minute threshold, not old capts.
+
+        A second check in family_rewards.due_reminder_minutes determines the
+        exact slot. 500 events per polling cycle is an ample cap for guild use.
+        """
+        from family_rewards import due_reminder_minutes
+        ranges = tuple(value for threshold in (30,15,5)
+                       for value in (now+threshold*60-90,now+threshold*60))
+        rows = self.conn.execute("""SELECT * FROM capt_events WHERE status='scheduled'
+            AND message_id IS NOT NULL AND
+            ((scheduled_at BETWEEN ? AND ?) OR
+             (scheduled_at BETWEEN ? AND ?) OR
+             (scheduled_at BETWEEN ? AND ?))
+            ORDER BY scheduled_at ASC LIMIT 500""",ranges).fetchall()
+        return [row for row in rows
+                if due_reminder_minutes(row["scheduled_at"], now) is not None]
 
     def claim_capt_reminder(self, event_id: int, remaining_minutes: int) -> bool:
         with self.conn:

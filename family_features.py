@@ -276,7 +276,17 @@ async def publish_new_capt(bot, i: discord.Interaction, details: dict, timestamp
     conf = bot.db.capt_settings(i.guild.id)
     channel = i.guild.get_channel(conf["channel_id"]) if conf["channel_id"] else None
     if not isinstance(channel, discord.TextChannel):
-        raise ValueError("Сначала создайте каналы: /menu → Капт-состав → Создать каналы.")
+        raise ValueError("Канал каптов не настроен. Откройте /menu → Капт-состав → Создать каналы.")
+    bot_member = i.guild.me or i.guild.get_member(bot.user.id)
+    if bot_member is not None:
+        permissions = channel.permissions_for(bot_member)
+        missing = [label for flag, label in (
+            ("view_channel", "Просматривать канал"),
+            ("send_messages", "Отправлять сообщения"),
+            ("embed_links", "Встраивать ссылки"),
+        ) if not getattr(permissions, flag, False)]
+        if missing:
+            raise ValueError(f"У бота нет прав в {channel.mention}: {', '.join(missing)}.")
     event_id = bot.db.create_capt(
         i.guild.id, i.user.id, details["opponent"], details["location"],
         details["format_text"], timestamp, details["capacity"]
@@ -294,9 +304,13 @@ async def publish_new_capt(bot, i: discord.Interaction, details: dict, timestamp
             ),
         )
         bot.db.attach_capt_event(event_id, channel.id, msg.id)
-    except discord.HTTPException:
-        bot.db.delete_unpublished_capt(event_id)
-        LOG.exception("Failed creating capt event")
+    except Exception:
+        # This may also fail on incompatible/old SQLite schemas, not only Discord API.
+        # Keep the event if the announcement was already sent, so it can be recovered.
+        existing = bot.db.capt_event(event_id)
+        if existing and not existing["message_id"]:
+            bot.db.delete_unpublished_capt(event_id)
+        LOG.exception("Failed creating capt event guild=%s event=%s", i.guild.id, event_id)
         raise
     await capt_log(bot, i.guild, "Создан капт",
                    f"Капт **#{event_id}** • {clean(event['opponent'])} • <t:{timestamp}:F> • <@{i.user.id}>")
@@ -417,16 +431,32 @@ class CaptScheduleConfirm(discord.ui.Button):
         except ValueError as exc:
             return await reply(i, f"❌ {exc}")
         picker.saving = True
-        await i.response.defer()  # acknowledges button without displaying a public message
+        # Update the actual ephemeral picker immediately. The user sees progress,
+        # rather than a button that seems to do nothing during the network request.
+        await i.response.edit_message(content="⏳ Публикую капт в канал...", view=None)
         try:
             event_id, channel = await publish_new_capt(picker.bot, i, picker.details, timestamp)
-        except (ValueError, discord.HTTPException) as exc:
+        except Exception as exc:
+            LOG.exception("Capt publication failed for guild=%s", i.guild.id if i.guild else None)
             picker.saving = False
-            return await i.edit_original_response(content=f"❌ Ошибка публикации: {exc}", view=picker)
-        await i.edit_original_response(
-            content=f"✅ Капт **#{event_id}** опубликован в {channel.mention} на <t:{timestamp}:F>.",
-            view=None,
-        )
+            picker.rebuild()
+            try:
+                return await i.edit_original_response(
+                    content=f"❌ Не удалось опубликовать капт: {type(exc).__name__}: {exc}\n"
+                            "Проверьте настройки канала и логи хостинга. Можно повторить попытку.",
+                    view=picker,
+                )
+            except discord.HTTPException:
+                LOG.exception("Could not show capt publication error")
+                return
+        try:
+            await i.edit_original_response(
+                content=f"✅ Капт **#{event_id}** опубликован в {channel.mention} на <t:{timestamp}:F>.",
+                view=None,
+            )
+        except discord.HTTPException:
+            # The capt was created; don't retry it just because confirmation failed.
+            LOG.exception("Capt created but success confirmation failed: guild=%s event=%s", i.guild.id, event_id)
 
 
 class CaptScheduleView(discord.ui.View):
@@ -1008,7 +1038,13 @@ class CaptAnnouncementRoleSelect(discord.ui.RoleSelect):
         role=self.values[0]
         if role.is_default():
             return await reply(i,"Нужно выбрать отдельную роль, а не @everyone.")
-        self.view.bot.db.set_capt_settings(i.guild.id, announce_role_id=role.id)
+        try:
+            self.view.bot.db.set_capt_settings(i.guild.id, announce_role_id=role.id)
+        except Exception as exc:
+            LOG.exception("Cannot save capt announcement role guild=%s", i.guild.id)
+            return await reply(i, "❌ Ошибка сохранения роли: "
+                               f"{type(exc).__name__}: {exc}. "
+                               "Убедитесь, что family_storage.py обновлён вместе с family_features.py.")
         can_ping = role.mentionable or (i.guild.me is not None and
                                        i.guild.me.guild_permissions.mention_everyone)
         notice=("Бот сможет уведомлять участников роли."
@@ -1115,9 +1151,12 @@ class CaptsAdminView(discord.ui.View):
     @discord.ui.button(label="Публиковать панель",style=discord.ButtonStyle.primary,row=1)
     async def panel(self,i,_):
         await i.response.defer(ephemeral=True,thinking=True)
-        try: msg=await publish_capt_hub(self.bot,i.guild)
-        except (ValueError,discord.HTTPException) as exc:
-            return await reply(i,f"❌ {exc}")
+        try:
+            msg = await publish_capt_hub(self.bot, i.guild)
+        except Exception as exc:
+            LOG.exception("Capt hub publication failed guild=%s", i.guild.id)
+            return await reply(i, f"❌ Не удалось опубликовать панель: {type(exc).__name__}: {exc}. "
+                               "Проверьте консоль хостинга и права канала каптов.")
         await reply(i,f"✅ Панель каптов повторно опубликована: {msg.jump_url}")
 
     @discord.ui.button(label="Журнал каптов",style=discord.ButtonStyle.secondary,row=2)
